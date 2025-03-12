@@ -3,11 +3,18 @@
 #include <etna/Etna.hpp>
 #include <etna/GlobalContext.hpp>
 #include <etna/PipelineManager.hpp>
+#include <etna/RenderTargetStates.hpp>
+
+#include "stb_image.h"
+#include <tracy/Tracy.hpp>
+#include <etna/Profiling.hpp>
+#include <chrono>
 
 
 App::App()
   : resolution{1280, 720}
   , useVsync{true}
+  , timeStart{std::chrono::system_clock::now()}
 {
   // First, we need to initialize Vulkan, which is not trivial because
   // extensions are required for just about anything.
@@ -35,7 +42,7 @@ App::App()
       .deviceExtensions = deviceExtensions,
       // Replace with an index if etna detects your preferred GPU incorrectly
       .physicalDeviceIndexOverride = {},
-      .numFramesInFlight = 1,
+      .numFramesInFlight = 3,
     });
   }
 
@@ -75,14 +82,80 @@ App::App()
 
 
   // TODO: Initialize any additional resources you require here!
-  etna::create_program("task1", {LOCAL_SHADERTOY1_SHADERS_ROOT "toy.comp.spv"});
-  et_pipeline = etna::get_context().getPipelineManager().createComputePipeline("task1", {});
-  et_image = etna::get_context().createImage(etna::Image::CreateInfo {
-    .extent = vk::Extent3D{resolution.x, resolution.y, 1}, 
-    .name = "task1",
+
+
+  etna::create_program(
+    "procedural_texture", 
+    {INFLIGHT_FRAMES_SHADERS_ROOT "toy_proc.comp.spv"});
+
+  et_pipeline =
+    etna::get_context().getPipelineManager().createComputePipeline("procedural_texture", {});
+
+  et_image = etna::get_context().createImage(etna::Image::CreateInfo{
+    .extent = vk::Extent3D{resolution.x, resolution.y, 1},
+    .name = "procedural_texture",
     .format = vk::Format::eR8G8B8A8Unorm,
-    .imageUsage = vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eStorage
+    .imageUsage = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eStorage});
+
+  et_sampler = etna::Sampler::Sampler(etna::Sampler::CreateInfo{
+    .addressMode = vk::SamplerAddressMode::eRepeat, .name = "textureSampler"});
+
+
+  int width, height, channels;
+  unsigned char* image_data = stbi_load(
+    GRAPHICS_COURSE_RESOURCES_ROOT "/textures/test_tex_1.png", &width, &height, &channels, 4);
+
+  fileTextureImage = etna::get_context().createImage(etna::Image::CreateInfo{
+    .extent = vk::Extent3D{static_cast<unsigned>(width), static_cast<unsigned>(height), 1},
+    .name = "file_texture",
+    .format = vk::Format::eR8G8B8A8Unorm,
+    .imageUsage = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eStorage |
+      vk::ImageUsageFlagBits::eTransferDst});
+
+  fileTextureSampler = etna::Sampler::Sampler(etna::Sampler::CreateInfo{
+    .addressMode = vk::SamplerAddressMode::eRepeat, .name = "fileTextureSampler"});
+
+  transferHelper =
+    std::make_unique<etna::BlockingTransferHelper>(etna::BlockingTransferHelper::CreateInfo{
+      .stagingSize = static_cast<std::uint32_t>(width * height),
     });
+
+  std::unique_ptr<etna::OneShotCmdMgr> OneShotCommands = etna::get_context().createOneShotCmdMgr();
+
+  transferHelper->uploadImage(*OneShotCommands, fileTextureImage, 0, 0,
+      std::span<const std::byte>(reinterpret_cast<const std::byte*>(image_data), width * height * 4));
+
+  stbi_image_free(image_data);
+
+
+  cur_frame = 0;
+
+  for (int i = 0; i < 3; ++i)
+  {
+    constantsBuffers.push_back(etna::get_context().createBuffer(etna::Buffer::CreateInfo{
+      .size = sizeof(Params),
+      .bufferUsage = vk::BufferUsageFlagBits::eUniformBuffer,
+      .memoryUsage = VMA_MEMORY_USAGE_CPU_ONLY,
+      .name = "constants_buffer",
+    }));
+    constantsBuffers[i].map();
+  }
+
+  etna::create_program(
+    "toy",
+    {INFLIGHT_FRAMES_SHADERS_ROOT "toy_vert.vert.spv",
+     INFLIGHT_FRAMES_SHADERS_ROOT "toy.frag.spv"});
+
+  shaderPipeline = 
+      etna::get_context().getPipelineManager().createGraphicsPipeline(
+          "toy", 
+          etna::GraphicsPipeline::CreateInfo{
+              .fragmentShaderOutput = 
+              {
+                  .colorAttachmentFormats = {vk::Format::eB8G8R8A8Srgb}
+              },
+          });
+
 }
 
 App::~App()
@@ -94,6 +167,7 @@ void App::run()
 {
   while (!osWindow->isBeingClosed())
   {
+    ZoneScopedN("tick");
     windowing.poll();
 
     drawFrame();
@@ -106,6 +180,8 @@ void App::run()
 
 void App::drawFrame()
 {
+  ZoneScopedN("drawFrame");
+
   // First, get a command buffer to write GPU commands into.
   auto currentCmdBuf = commandManager->acquireNext();
 
@@ -117,12 +193,16 @@ void App::drawFrame()
 
   // When window is minimized, we can't render anything in Windows
   // because it kills the swapchain, so we skip frames in this case.
+
   if (nextSwapchainImage)
   {
+    ZoneScopedN("nextSwapchainImage");
     auto [backbuffer, backbufferView, backbufferAvailableSem] = *nextSwapchainImage;
 
     ETNA_CHECK_VK_RESULT(currentCmdBuf.begin(vk::CommandBufferBeginInfo{}));
     {
+      ETNA_PROFILE_GPU(currentCmdBuf, renderFrame);
+
       // First of all, we need to "initialize" th "backbuffer", aka the current swapchain
       // image, into a state that is appropriate for us working with it. The initial state
       // is considered to be "undefined" (aka "I contain trash memory"), by the way.
@@ -131,12 +211,9 @@ void App::drawFrame()
       etna::set_state(
         currentCmdBuf,
         backbuffer,
-        // We are going to use the texture at the transfer stage...
-        vk::PipelineStageFlagBits2::eTransfer,
-        // ...to transfer-write stuff into it...
-        vk::AccessFlagBits2::eTransferWrite,
-        // ...and want it to have the appropriate layout.
-        vk::ImageLayout::eTransferDstOptimal,
+        vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+        vk::AccessFlagBits2::eColorAttachmentWrite,
+        vk::ImageLayout::eColorAttachmentOptimal,
         vk::ImageAspectFlagBits::eColor);
       // The set_state doesn't actually record any commands, they are deferred to
       // the moment you call flush_barriers.
@@ -147,36 +224,81 @@ void App::drawFrame()
 
 
       // TODO: Record your commands here!
-      auto simpleComputeInfo = etna::get_shader_program("task1");
 
-      auto set = etna::create_descriptor_set(
-          simpleComputeInfo.getDescriptorLayoutId(0),
+      float time =
+        std::chrono::duration<float>(std::chrono::system_clock::now() - timeStart).count();
+
+      Params param{
+          .iResolution = resolution, 
+          .iMouse = osWindow->mouse.freePos, 
+          .iTime = time
+      };
+      std::memcpy(constantsBuffers[cur_frame % 3].data(), &param, sizeof(param));
+
+      {
+        ZoneScopedN("toy_proc_shader");
+        auto computeInfo = etna::get_shader_program("procedural_texture");
+
+        auto set = etna::create_descriptor_set(
+          computeInfo.getDescriptorLayoutId(0),
           currentCmdBuf,
           {
-         etna::Binding{0, et_image.genBinding(et_sampler.get(), vk::ImageLayout::eGeneral)}
+                etna::Binding{0, et_image.genBinding({}, vk::ImageLayout::eGeneral)},
+                etna::Binding{1, constantsBuffers[cur_frame % 3].genBinding()}
           });
 
-      vk::DescriptorSet vkSet = set.getVkSet();
+        vk::DescriptorSet vkSet = set.getVkSet();
 
-      currentCmdBuf.bindPipeline(vk::PipelineBindPoint::eCompute, et_pipeline.getVkPipeline());
-      currentCmdBuf.bindDescriptorSets(
-        vk::PipelineBindPoint::eCompute, et_pipeline.getVkPipelineLayout(), 0, 1, &vkSet, 0, nullptr);
+        currentCmdBuf.bindPipeline(vk::PipelineBindPoint::eCompute, et_pipeline.getVkPipeline());
+        currentCmdBuf.bindDescriptorSets(vk::PipelineBindPoint::eCompute, et_pipeline.getVkPipelineLayout(),
+          0, 1, &vkSet, 0, nullptr);
+
+        currentCmdBuf.pushConstants( et_pipeline.getVkPipelineLayout(), vk::ShaderStageFlagBits::eCompute, 0, sizeof(param), &param);
+
+        etna::flush_barriers(currentCmdBuf);
+
+        currentCmdBuf.dispatch(resolution.x / 32, resolution.y / 32, 1);
+      }
+
+
+      etna::set_state(
+        currentCmdBuf,
+        et_image.get(),
+        vk::PipelineStageFlagBits2::eFragmentShader,
+        vk::AccessFlagBits2::eShaderSampledRead,
+        vk::ImageLayout::eShaderReadOnlyOptimal,
+        vk::ImageAspectFlagBits::eColor);
+
       etna::flush_barriers(currentCmdBuf);
 
-      currentCmdBuf.dispatch(resolution.x / 32, resolution.y / 32, 1);
 
-       vk::ImageBlit Blit{
-          {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
-        std::array{vk::Offset3D(0, 0, 0), vk::Offset3D(resolution.x, resolution.y, 1)},
-          {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
-        std::array{vk::Offset3D(0, 0, 0), vk::Offset3D(resolution.x, resolution.y, 1)}};
-      currentCmdBuf.blitImage(
-          et_image.get(),
-          vk::ImageLayout::eGeneral,
-          backbuffer,
-          vk::ImageLayout::eTransferDstOptimal,
-          Blit,
-          vk::Filter::eLinear);
+      {
+        ZoneScopedN("toy_shader");
+
+        etna::RenderTargetState state{currentCmdBuf, {{}, {resolution.x, resolution.y}}, 
+            {{backbuffer, backbufferView}}, {}};
+
+        auto graphicsInfo = etna::get_shader_program("toy");
+
+        auto set = etna::create_descriptor_set(
+          graphicsInfo.getDescriptorLayoutId(0),
+          currentCmdBuf,
+          {
+                etna::Binding{0, et_image.genBinding(et_sampler.get(), vk::ImageLayout::eShaderReadOnlyOptimal)},
+                etna::Binding{1, fileTextureImage.genBinding(fileTextureSampler.get(), vk::ImageLayout::eShaderReadOnlyOptimal)},
+                etna::Binding{2, constantsBuffers[cur_frame % 3].genBinding()}
+          });
+
+        vk::DescriptorSet vkSet = set.getVkSet();
+
+        currentCmdBuf.bindPipeline(vk::PipelineBindPoint::eGraphics, shaderPipeline.getVkPipeline());
+        currentCmdBuf.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, shaderPipeline.getVkPipelineLayout(),
+          0, 1, &vkSet, 0, nullptr);
+
+        currentCmdBuf.pushConstants(shaderPipeline.getVkPipelineLayout(), vk::ShaderStageFlagBits::eFragment, 0, sizeof(param), &param);
+
+        currentCmdBuf.draw(3, 1, 0, 0);
+      }
 
       // At the end of "rendering", we are required to change how the pixels of the
       // swpchain image are laid out in memory to something that is appropriate
@@ -191,6 +313,12 @@ void App::drawFrame()
         vk::ImageAspectFlagBits::eColor);
       // And of course flush the layout transition.
       etna::flush_barriers(currentCmdBuf);
+
+      std::this_thread::sleep_for(std::chrono::milliseconds(7));
+
+      ++cur_frame;
+
+      ETNA_READ_BACK_GPU_PROFILING(currentCmdBuf);
     }
     ETNA_CHECK_VK_RESULT(currentCmdBuf.end());
 

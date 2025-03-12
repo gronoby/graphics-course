@@ -1,8 +1,10 @@
-#version 430
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
 
-layout(local_size_x = 32, local_size_y = 32) in;
+layout(location = 0) out vec4 fragColor;
 
-layout(binding = 0, rgba8) uniform image2D resultImage;
+layout(binding = 0) uniform sampler2D colorTex;
+layout(binding = 1) uniform sampler2D fileTex;
 
 float sphereSDF(in vec3 p, in float r)
 {
@@ -102,7 +104,7 @@ void mainImage( out vec4 fragColor, in vec2 fragCoord )
 
 void main()
 {
-  ivec2 fragCoord = ivec2(gl_GlobalInvocationID.xy);
+  vec2 fragCoord = vec2(gl_FragCoord).xy;
   vec2 uv = pixel_offset(fragCoord);
   vec3 camera_offset = vec3(0, 0, -4);
   vec3 dir = normalize(vec3(uv.x, uv.y, 1));
@@ -110,13 +112,23 @@ void main()
   bool hit = false;
   vec3 col = vec3(0, 0, 0);
   vec3 p = raytrace(camera_offset, dir, hit);
+  vec4 fragColor_test = vec4(vec3(0.), 1.);
   if (hit)
   {
+	  vec3 n = get_normal(p);
+      vec3 w = abs(n);
       col = phong_lighting(p, get_normal(p), dir);
+	  vec3 texel1 =
+            w.x * textureLod(colorTex, vec2(0.5) + 1.5 * p.yz, 0).rgb +
+            w.y * textureLod(colorTex, vec2(0.5) + 1.5 * p.xz, 0).rgb +
+            w.z * textureLod(colorTex, vec2(0.5) + 1.5 * p.xy, 0).rgb;
+		vec3 texel2 =
+            w.x * textureLod(fileTex, vec2(0.5) + 0.35 * p.yz, 0).rgb +
+            w.y * textureLod(fileTex, vec2(0.5) + 0.35 * p.xz, 0).rgb +
+            w.z * textureLod(fileTex, vec2(0.5) + 0.35 * p.xy, 0).rgb;
+	
+		fragColor_test = vec4(0.5 * col,1.0);
+		fragColor_test = fragColor_test * vec4(texel1, 1.0) * vec4(texel2, 1.0);
   }
-
-  vec4 fragColor = vec4(0.5 * col,1.0);
-
-  if (fragCoord.x < 1280 && fragCoord.y < 720)
-    imageStore(resultImage, fragCoord, fragColor);
+	fragColor = fragColor_test;
 }

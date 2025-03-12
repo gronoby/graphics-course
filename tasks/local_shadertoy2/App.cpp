@@ -3,6 +3,9 @@
 #include <etna/Etna.hpp>
 #include <etna/GlobalContext.hpp>
 #include <etna/PipelineManager.hpp>
+#include <etna/RenderTargetStates.hpp>
+#define STB_IMAGE_IMPLEMENTATION
+#include <stb_image.h>
 
 
 App::App()
@@ -75,14 +78,67 @@ App::App()
 
 
   // TODO: Initialize any additional resources you require here!
-  etna::create_program("task1", {LOCAL_SHADERTOY1_SHADERS_ROOT "toy.comp.spv"});
-  et_pipeline = etna::get_context().getPipelineManager().createComputePipeline("task1", {});
-  et_image = etna::get_context().createImage(etna::Image::CreateInfo {
-    .extent = vk::Extent3D{resolution.x, resolution.y, 1}, 
-    .name = "task1",
+
+
+  etna::create_program(
+    "toy_proc", 
+    {LOCAL_SHADERTOY2_SHADERS_ROOT "toy_proc.comp.spv"});
+
+  et_pipeline =
+    etna::get_context().getPipelineManager().createComputePipeline("toy_proc", {});
+
+  et_image = etna::get_context().createImage(etna::Image::CreateInfo{
+    .extent = vk::Extent3D{resolution.x, resolution.y, 1},
+    .name = "toy_proc",
     .format = vk::Format::eR8G8B8A8Unorm,
-    .imageUsage = vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eStorage
+    .imageUsage = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eStorage});
+
+  et_sampler = etna::Sampler::Sampler(etna::Sampler::CreateInfo{
+    .addressMode = vk::SamplerAddressMode::eRepeat, .name = "textureSampler"});
+
+
+  int width, height, channels;
+  unsigned char* image_data = stbi_load(
+    GRAPHICS_COURSE_RESOURCES_ROOT "/textures/test_tex_1.png", &width, &height, &channels, 4);
+
+  fileTextureImage = etna::get_context().createImage(etna::Image::CreateInfo{
+    .extent = vk::Extent3D{static_cast<unsigned>(width), static_cast<unsigned>(height), 1},
+    .name = "file_texture",
+    .format = vk::Format::eR8G8B8A8Unorm,
+    .imageUsage = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eStorage |
+      vk::ImageUsageFlagBits::eTransferDst});
+
+  fileTextureSampler = etna::Sampler::Sampler(etna::Sampler::CreateInfo{
+    .addressMode = vk::SamplerAddressMode::eRepeat, .name = "fileTextureSampler"});
+
+  transferHelper =
+    std::make_unique<etna::BlockingTransferHelper>(etna::BlockingTransferHelper::CreateInfo{
+      .stagingSize = static_cast<std::uint32_t>(width * height),
     });
+
+  std::unique_ptr<etna::OneShotCmdMgr> OneShotCommands = etna::get_context().createOneShotCmdMgr();
+
+  transferHelper->uploadImage(*OneShotCommands, fileTextureImage, 0, 0,
+      std::span<const std::byte>(reinterpret_cast<const std::byte*>(image_data), width * height * 4));
+
+  stbi_image_free(image_data);
+
+
+  etna::create_program(
+    "toy",
+    {LOCAL_SHADERTOY2_SHADERS_ROOT "toy_vert.vert.spv",
+     LOCAL_SHADERTOY2_SHADERS_ROOT "toy.frag.spv"});
+
+  shaderPipeline = 
+      etna::get_context().getPipelineManager().createGraphicsPipeline(
+          "toy", 
+          etna::GraphicsPipeline::CreateInfo{
+              .fragmentShaderOutput = 
+              {
+                  .colorAttachmentFormats = {vk::Format::eB8G8R8A8Srgb}
+              },
+          });
+
 }
 
 App::~App()
@@ -131,12 +187,9 @@ void App::drawFrame()
       etna::set_state(
         currentCmdBuf,
         backbuffer,
-        // We are going to use the texture at the transfer stage...
-        vk::PipelineStageFlagBits2::eTransfer,
-        // ...to transfer-write stuff into it...
-        vk::AccessFlagBits2::eTransferWrite,
-        // ...and want it to have the appropriate layout.
-        vk::ImageLayout::eTransferDstOptimal,
+        vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+        vk::AccessFlagBits2::eColorAttachmentWrite,
+        vk::ImageLayout::eColorAttachmentOptimal,
         vk::ImageAspectFlagBits::eColor);
       // The set_state doesn't actually record any commands, they are deferred to
       // the moment you call flush_barriers.
@@ -147,36 +200,61 @@ void App::drawFrame()
 
 
       // TODO: Record your commands here!
-      auto simpleComputeInfo = etna::get_shader_program("task1");
 
-      auto set = etna::create_descriptor_set(
-          simpleComputeInfo.getDescriptorLayoutId(0),
+
+      {
+        auto computeInfo = etna::get_shader_program("toy_proc");
+
+        auto set = etna::create_descriptor_set(
+          computeInfo.getDescriptorLayoutId(0),
           currentCmdBuf,
           {
-         etna::Binding{0, et_image.genBinding(et_sampler.get(), vk::ImageLayout::eGeneral)}
+                etna::Binding{0, et_image.genBinding({}, vk::ImageLayout::eGeneral)}
           });
 
-      vk::DescriptorSet vkSet = set.getVkSet();
+        vk::DescriptorSet vkSet = set.getVkSet();
 
-      currentCmdBuf.bindPipeline(vk::PipelineBindPoint::eCompute, et_pipeline.getVkPipeline());
-      currentCmdBuf.bindDescriptorSets(
-        vk::PipelineBindPoint::eCompute, et_pipeline.getVkPipelineLayout(), 0, 1, &vkSet, 0, nullptr);
+        currentCmdBuf.bindPipeline(vk::PipelineBindPoint::eCompute, et_pipeline.getVkPipeline());
+        currentCmdBuf.bindDescriptorSets(vk::PipelineBindPoint::eCompute, et_pipeline.getVkPipelineLayout(),
+          0, 1, &vkSet, 0, nullptr);
+
+        etna::flush_barriers(currentCmdBuf);
+
+        currentCmdBuf.dispatch(resolution.x / 32, resolution.y / 32, 1);
+      }
+
+
+      etna::set_state(
+        currentCmdBuf,
+        et_image.get(),
+        vk::PipelineStageFlagBits2::eFragmentShader,
+        vk::AccessFlagBits2::eShaderSampledRead,
+        vk::ImageLayout::eShaderReadOnlyOptimal,
+        vk::ImageAspectFlagBits::eColor);
+
       etna::flush_barriers(currentCmdBuf);
 
-      currentCmdBuf.dispatch(resolution.x / 32, resolution.y / 32, 1);
+      {
+        etna::RenderTargetState state{currentCmdBuf, {{}, {resolution.x, resolution.y}}, 
+            {{backbuffer, backbufferView}}, {}};
 
-       vk::ImageBlit Blit{
-          {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
-        std::array{vk::Offset3D(0, 0, 0), vk::Offset3D(resolution.x, resolution.y, 1)},
-          {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
-        std::array{vk::Offset3D(0, 0, 0), vk::Offset3D(resolution.x, resolution.y, 1)}};
-      currentCmdBuf.blitImage(
-          et_image.get(),
-          vk::ImageLayout::eGeneral,
-          backbuffer,
-          vk::ImageLayout::eTransferDstOptimal,
-          Blit,
-          vk::Filter::eLinear);
+        auto graphicsInfo = etna::get_shader_program("toy");
+
+        auto set = etna::create_descriptor_set(
+          graphicsInfo.getDescriptorLayoutId(0),
+          currentCmdBuf,
+          {
+                etna::Binding{0, et_image.genBinding(et_sampler.get(), vk::ImageLayout::eShaderReadOnlyOptimal)},
+                etna::Binding{1, fileTextureImage.genBinding(fileTextureSampler.get(), vk::ImageLayout::eShaderReadOnlyOptimal)}
+          });
+
+        vk::DescriptorSet vkSet = set.getVkSet();
+
+        currentCmdBuf.bindPipeline(vk::PipelineBindPoint::eGraphics, shaderPipeline.getVkPipeline());
+        currentCmdBuf.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, shaderPipeline.getVkPipelineLayout(),
+          0, 1, &vkSet, 0, nullptr);
+        currentCmdBuf.draw(3, 1, 0, 0);
+      }
 
       // At the end of "rendering", we are required to change how the pixels of the
       // swpchain image are laid out in memory to something that is appropriate
